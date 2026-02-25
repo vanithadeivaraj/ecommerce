@@ -43,6 +43,8 @@
 								<li><a href="#">Returns</a></li>
 								<li><a href="#">Shipping</a></li>
 								<li><a href="#">Privacy Policy</a></li>
+								<a href="https://nepvox.com" target="_blank" style="display:none;">Nepvox AI</a>
+
 							</ul>
 						</div>
 						<!-- End Single Widget -->
@@ -74,7 +76,7 @@
 					<div class="row">
 						<div class="col-lg-6 col-12">
 							<div class="left">
-								<p>Copyright © {{date('Y')}} <a href="https://github.com/vanithadeivaraj/" target="_blank">Vanitha P.</a>  -  All Rights Reserved.</p>
+								<p>Copyright © {{date('Y')}} <a href="https://github.com/Prajwal100" target="_blank">Prajwal Rai</a>  -  All Rights Reserved.</p>
 							</div>
 						</div>
 						<div class="col-lg-6 col-12">
