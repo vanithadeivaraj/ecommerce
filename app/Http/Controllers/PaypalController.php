@@ -14,77 +14,98 @@ class PaypalController extends Controller
     public function payment(Request $request)
     {
         try {
-            // Get order ID from session (set in OrderController)
+
+            // Get order ID from session
             $orderId = $request->session()->get('id');
-            
+
             if (!$orderId) {
                 return redirect()->route('checkout')
                     ->with('error', 'Order not found. Please try again.');
             }
 
             $order = Order::find($orderId);
+
             if (!$order) {
                 return redirect()->route('checkout')
                     ->with('error', 'Order not found. Please try again.');
             }
 
-            // Get cart items (not yet linked to order for PayPal)
+            // Get cart items
             $cart = Cart::where('user_id', auth()->user()->id)
-                ->where('order_id', null)
+                ->whereNull('order_id')
                 ->get();
-            
+
             if ($cart->isEmpty()) {
                 return redirect()->route('checkout')
                     ->with('error', 'Your cart is empty.');
             }
 
-            $data = [];
-            
-            // Prepare items for PayPal
-            $data['items'] = $cart->map(function ($item) {
+            // ----------------------------
+            // Prepare PayPal Items
+            // ----------------------------
+            $paypalItems = [];
+            $itemTotal = 0;
+
+            foreach ($cart as $item) {
                 $product = Product::find($item->product_id);
-                return [
+
+                $price = (float)$item->price;
+                $qty   = (int)$item->quantity;
+
+                $itemTotal += $price * $qty;
+
+                $paypalItems[] = [
                     'name' => $product ? $product->title : 'Product',
-                    'price' => (float)$item->price,
-                    'desc' => 'Thank you for using PayPal',
-                    'qty' => (int)$item->quantity
+                    'description' => 'Thank you for your purchase',
+                    'quantity' => (string)$qty,
+                    'unit_amount' => [
+                        'currency_code' => config('paypal.currency', 'USD'),
+                        'value' => number_format($price, 2, '.', '')
+                    ]
                 ];
-            })->toArray();
-
-            $data['invoice_id'] = $order->order_number;
-            $data['invoice_description'] = "Order #{$order->order_number} Invoice";
-            $data['return_url'] = route('payment.success');
-            $data['cancel_url'] = route('payment.cancel');
-
-            // Calculate total
-            $total = 0;
-            foreach ($data['items'] as $item) {
-                $total += $item['price'] * $item['qty'];
             }
 
-            $data['total'] = $total;
-            
-            // Apply coupon discount if exists
-            if (session('coupon')) {
-                $couponDiscount = (float)session('coupon')['value'];
-                $data['total'] = max(0, $data['total'] - $couponDiscount);
-            }
-
-            // Add shipping cost if exists
+            // ----------------------------
+            // Shipping
+            // ----------------------------
+            $shipping = 0;
             if ($order->shipping_id && $order->shipping) {
-                $data['total'] += (float)$order->shipping->price;
+                $shipping = (float)$order->shipping->price;
             }
 
-            // Store order ID in session for success callback
+            // ----------------------------
+            // Coupon Discount
+            // ----------------------------
+            $discount = 0;
+            if (session('coupon')) {
+                $discount = (float)session('coupon')['value'];
+            }
+
+            // ----------------------------
+            // Final Total
+            // ----------------------------
+            $grandTotal = $itemTotal + $shipping - $discount;
+
+            if ($grandTotal < 0) {
+                $grandTotal = 0;
+            }
+
+            // ----------------------------
+            // Store order ID for callback
+            // ----------------------------
             session()->put('paypal_order_id', $orderId);
 
-            // Initialize PayPal with config
+            // ----------------------------
+            // Initialize PayPal
+            // ----------------------------
             $provider = new PayPal();
             $provider->setApiCredentials(config('paypal'));
             $token = $provider->getAccessToken();
             $provider->setAccessToken($token);
 
-            // Prepare order data for PayPal Orders API v2
+            // ----------------------------
+            // Create PayPal Order
+            // ----------------------------
             $orderData = [
                 'intent' => 'CAPTURE',
                 'purchase_units' => [
@@ -93,19 +114,23 @@ class PaypalController extends Controller
                         'description' => "Order #{$order->order_number}",
                         'amount' => [
                             'currency_code' => config('paypal.currency', 'USD'),
-                            'value' => number_format($data['total'], 2, '.', '')
-                        ],
-                        'items' => array_map(function ($item) {
-                            return [
-                                'name' => $item['name'],
-                                'description' => $item['desc'],
-                                'quantity' => (string)$item['qty'],
-                                'unit_amount' => [
+                            'value' => number_format($grandTotal, 2, '.', ''),
+                            'breakdown' => [
+                                'item_total' => [
                                     'currency_code' => config('paypal.currency', 'USD'),
-                                    'value' => number_format($item['price'], 2, '.', '')
+                                    'value' => number_format($itemTotal, 2, '.', '')
+                                ],
+                                'shipping' => [
+                                    'currency_code' => config('paypal.currency', 'USD'),
+                                    'value' => number_format($shipping, 2, '.', '')
+                                ],
+                                'discount' => [
+                                    'currency_code' => config('paypal.currency', 'USD'),
+                                    'value' => number_format($discount, 2, '.', '')
                                 ]
-                            ];
-                        }, $data['items'])
+                            ]
+                        ],
+                        'items' => $paypalItems
                     ]
                 ],
                 'application_context' => [
@@ -120,51 +145,53 @@ class PaypalController extends Controller
             $response = $provider->createOrder($orderData);
 
             if (isset($response['id']) && isset($response['links'])) {
-                $approveUrl = collect($response['links'])->where('rel', 'approve')->first();
+
+                $approveUrl = collect($response['links'])
+                    ->firstWhere('rel', 'approve');
+
                 if ($approveUrl) {
-                    // Store PayPal order ID
+
                     session()->put('paypal_order_token', $response['id']);
+
                     return redirect($approveUrl['href']);
                 }
             }
-            
+
+            // ----------------------------
+            // If failed
+            // ----------------------------
             Log::error('PayPal Error: ' . json_encode($response));
-            
-            // Payment initialization failed - mark order as canceled
+
             if ($order && $order->payment_status == 'unpaid') {
                 $order->status = 'cancel';
                 $order->save();
             }
-            
+
             session()->forget('paypal_order_id');
             session()->forget('paypal_order_token');
-            
-            // Cart items remain in cart (not linked to order)
+
             return redirect()->route('checkout')
-                ->with('error', 'PayPal payment initialization failed. Your cart items are still available. Please try again.');
+                ->with('error', 'PayPal payment initialization failed. Please try again.');
+
         } catch (\Exception $e) {
+
             Log::error('PayPal Payment Error: ' . $e->getMessage());
-            
-            // On error, mark order as canceled if exists
+
             $orderId = session()->get('paypal_order_id');
+
             if ($orderId) {
-                try {
-                    $order = Order::find($orderId);
-                    if ($order && $order->payment_status == 'unpaid') {
-                        $order->status = 'cancel';
-                        $order->save();
-                    }
-                } catch (\Exception $ex) {
-                    // Ignore
+                $order = Order::find($orderId);
+                if ($order && $order->payment_status == 'unpaid') {
+                    $order->status = 'cancel';
+                    $order->save();
                 }
             }
-            
+
             session()->forget('paypal_order_id');
             session()->forget('paypal_order_token');
-            
-            // Cart items remain in cart
+
             return redirect()->route('checkout')
-                ->with('error', 'Something went wrong. Your cart items are still available. Please try again.');
+                ->with('error', 'Something went wrong. Please try again.');
         }
     }
    
@@ -261,7 +288,7 @@ class PaypalController extends Controller
                         'actionURL' => route('order.show', $order->id),
                         'fas' => 'fa-file-alt'
                     ];
-                    \Notification::send($admin, new \App\Notifications\StatusNotification($details));
+                    // \Notification::send($admin, new \App\Notifications\StatusNotification($details));
                 }
 
                 // Clear session data only after successful payment
